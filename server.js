@@ -34,6 +34,22 @@ let whatsappOfferSdp = null;
 let browserSocket = null;
 let currentCallId = null;
 
+// Webhook verification endpoint
+app.get("/chatterbox/whatsapp-cloud", (req, res) => {
+    const verifyToken = process.env.VERIFY_TOKEN;
+    const mode = req.query["hub.mode"];
+    const token = req.query["hub.verify_token"];
+    const challenge = req.query["hub.challenge"];
+
+    if (mode === "subscribe" && token === verifyToken) {
+        console.log("Webhook verified successfully.");
+        res.status(200).send(challenge);
+    } else {
+        console.error("Webhook verification failed.");
+        res.sendStatus(403);
+    }
+});
+
 /**
  * Socket.IO connection from browser client.
  */
@@ -78,8 +94,9 @@ io.on("connection", (socket) => {
 /**
  * Handles incoming WhatsApp webhook call events.
  */
-app.post("/call-events", async (req, res) => {
+app.post("/chatterbox/whatsapp-cloud", async (req, res) => {
     try {
+        console.log(`Whatsapp webhook received successfully`);
         const entry = req.body?.entry?.[0];
         const change = entry?.changes?.[0];
         const call = change?.value?.calls?.[0];
@@ -94,6 +111,7 @@ app.post("/call-events", async (req, res) => {
         currentCallId = callId;
 
         if (call.event === "connect") {
+            console.log(`Call event connect received successfully`)
             whatsappOfferSdp = call?.session?.sdp;
             const callerName = contact?.profile?.name || "Unknown";
             const callerNumber = contact?.wa_id || "Unknown";
@@ -126,90 +144,101 @@ app.post("/call-events", async (req, res) => {
  * Initiates WebRTC between browser and WhatsApp once both SDP offers are received.
  */
 async function initiateWebRTCBridge() {
-    if (!browserOfferSdp || !whatsappOfferSdp || !browserSocket) return;
+    console.log(`InitiateWebRTCBridge() invoked!`);
 
-    // --- Setup browser peer connection ---
-    browserPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    browserStream = new MediaStream();
-
-    browserPc.ontrack = (event) => {
-        console.log("Audio track received from browser.");
-        event.streams[0].getTracks().forEach((track) => browserStream.addTrack(track));
-    };
-
-    browserPc.onicecandidate = (event) => {
-        if (event.candidate) {
-            browserSocket.emit("browser-candidate", event.candidate);
-        }
-    };
-
-    await browserPc.setRemoteDescription(new RTCSessionDescription({
-        type: "offer",
-        sdp: browserOfferSdp
-    }));
-    console.log("Browser offer SDP set as remote description.");
-
-    // --- Setup WhatsApp peer connection ---
-    whatsappPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-    const waTrackPromise = new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject("Timed out waiting for WhatsApp track"), 10000);
-        whatsappPc.ontrack = (event) => {
-            clearTimeout(timeout);
-            console.log("Audio track received from WhatsApp.");
-            whatsappStream = event.streams[0];
-            resolve();
-        };
-    });
-
-    await whatsappPc.setRemoteDescription(new RTCSessionDescription({
-        type: "offer",
-        sdp: whatsappOfferSdp
-    }));
-    console.log("WhatsApp offer SDP set as remote description.");
-
-    // Forward browser mic to WhatsApp
-    browserStream?.getAudioTracks().forEach((track) => {
-        whatsappPc.addTrack(track, browserStream);
-    });
-    console.log("Forwarded browser audio to WhatsApp.");
-
-    // Wait for WhatsApp to send audio
-    await waTrackPromise;
-
-    // Forward WhatsApp audio to browser
-    whatsappStream?.getAudioTracks().forEach((track) => {
-        browserPc.addTrack(track, whatsappStream);
-    });
-
-    // --- Create SDP answers for both peers ---
-    const browserAnswer = await browserPc.createAnswer();
-    await browserPc.setLocalDescription(browserAnswer);
-    browserSocket.emit("browser-answer", browserAnswer.sdp);
-    console.log("Browser answer SDP created and sent.");
-
-    const waAnswer = await whatsappPc.createAnswer();
-    await whatsappPc.setLocalDescription(waAnswer);
-    const finalWaSdp = waAnswer.sdp.replace("a=setup:actpass", "a=setup:active");
-    console.log("WhatsApp answer SDP prepared.");
-
-    // Send pre-accept, and only proceed with accept if successful
-    const preAcceptSuccess = await answerCallToWhatsApp(currentCallId, finalWaSdp, "pre_accept");
-
-    if (preAcceptSuccess) {
-        setTimeout(async () => {
-            const acceptSuccess = await answerCallToWhatsApp(currentCallId, finalWaSdp, "accept");
-            if (acceptSuccess && browserSocket) {
-                browserSocket.emit("start-browser-timer");
-            }
-        }, 1000);
-    } else {
-        console.error("Pre-accept failed. Aborting accept step.");
+    if (!browserOfferSdp || !whatsappOfferSdp || !browserSocket) {
+        console.log("Missing required data for WebRTC bridge setup.");
+        return;
     }
 
-    // Reset session state
-    browserOfferSdp = null;
-    whatsappOfferSdp = null;
+    try {
+        // --- Setup browser peer connection ---
+        browserPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+        console.log(`New RTCPeerConnection() established with browser`);
+        browserStream = new MediaStream();
+
+        browserPc.ontrack = (event) => {
+            console.log("Audio track received from browser.");
+            event.streams[0].getTracks().forEach((track) => browserStream.addTrack(track));
+        };
+
+        browserPc.onicecandidate = (event) => {
+            if (event.candidate) {
+                browserSocket.emit("browser-candidate", event.candidate);
+            }
+        };
+
+        await browserPc.setRemoteDescription(new RTCSessionDescription({
+            type: "offer",
+            sdp: browserOfferSdp
+        }));
+        console.log("Browser offer SDP set as remote description.");
+
+        // --- Setup WhatsApp peer connection ---
+        whatsappPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+        const waTrackPromise = new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => reject("Timed out waiting for WhatsApp track"), 10000);
+            whatsappPc.ontrack = (event) => {
+                clearTimeout(timeout);
+                console.log("Audio track received from WhatsApp.");
+                whatsappStream = event.streams[0];
+                resolve();
+            };
+        });
+
+        await whatsappPc.setRemoteDescription(new RTCSessionDescription({
+            type: "offer",
+            sdp: whatsappOfferSdp
+        }));
+        console.log("WhatsApp offer SDP set as remote description.");
+
+        // Forward browser mic to WhatsApp
+        browserStream?.getAudioTracks().forEach((track) => {
+            whatsappPc.addTrack(track, browserStream);
+        });
+        console.log("Forwarded browser audio to WhatsApp.");
+
+        // Wait for WhatsApp to send audio
+        await waTrackPromise;
+
+        // Forward WhatsApp audio to browser
+        whatsappStream?.getAudioTracks().forEach((track) => {
+            browserPc.addTrack(track, whatsappStream);
+        });
+
+        // --- Create SDP answers for both peers ---
+        const browserAnswer = await browserPc.createAnswer();
+        await browserPc.setLocalDescription(browserAnswer);
+        browserSocket.emit("browser-answer", browserAnswer.sdp);
+        console.log("Browser answer SDP created and sent.");
+
+        const waAnswer = await whatsappPc.createAnswer();
+        await whatsappPc.setLocalDescription(waAnswer);
+        const finalWaSdp = waAnswer.sdp.replace("a=setup:actpass", "a=setup:active");
+        console.log("WhatsApp answer SDP prepared.");
+
+        // Send pre-accept, and only proceed with accept if successful
+        const preAcceptSuccess = await answerCallToWhatsApp(currentCallId, finalWaSdp, "pre_accept");
+
+        if (preAcceptSuccess) {
+            setTimeout(async () => {
+                const acceptSuccess = await answerCallToWhatsApp(currentCallId, finalWaSdp, "accept");
+                if (acceptSuccess && browserSocket) {
+                    browserSocket.emit("start-browser-timer");
+                }
+            }, 1000);
+        } else {
+            console.error("Pre-accept failed. Aborting accept step.");
+            cleanup();
+        }
+    } catch (error) {
+        console.error("WebRTC bridge setup failed:", error.message);
+        cleanup();
+        if (browserSocket) {
+            browserSocket.emit("call-ended");
+        }
+    }
 }
 
 /**
@@ -284,7 +313,7 @@ async function rejectCall(callId) {
  * Terminate WhatsApp call.
  * Returns WhatsApp API response.
  */
- async function terminateCall(callId) {
+async function terminateCall(callId) {
     const body = {
         messaging_product: "whatsapp",
         call_id: callId,
@@ -314,8 +343,38 @@ async function rejectCall(callId) {
     }
 }
 
+/**
+ * Cleanup function to release resources.
+ */
+function cleanup() {
+    if (browserPc) {
+        browserPc.close();
+        browserPc = null;
+        console.log("Browser peer connection closed.");
+    }
+    if (whatsappPc) {
+        whatsappPc.close();
+        whatsappPc = null;
+        console.log("WhatsApp peer connection closed.");
+    }
+    if (browserStream) {
+        browserStream.getTracks().forEach(track => track.stop());
+        browserStream = null;
+        console.log("Browser stream stopped.");
+    }
+    if (whatsappStream) {
+        whatsappStream.getTracks().forEach(track => track.stop());
+        whatsappStream = null;
+        console.log("WhatsApp stream stopped.");
+    }
+    browserOfferSdp = null;
+    whatsappOfferSdp = null;
+    browserSocket = null;
+    currentCallId = null;
+}
+
 // Start the server
-const PORT = process.env.PORT || 19000;
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
     console.log(`Server is running at http://0.0.0.0:${PORT}`);
 });
